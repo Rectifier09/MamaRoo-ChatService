@@ -37,6 +37,9 @@ The endpoint end-user-facing frontends call.
 - `session_id` (integer, optional) — omit or send `null` to start a new conversation.
   Send back the `session_id` from a prior response to continue that conversation
   (the server loads recent history itself — the client does not resend prior turns).
+- `stream` (boolean, optional, default `false`) — when `true`, the response
+  is `text/event-stream` instead of a single JSON body (see below). When
+  absent or `false`, behavior is unchanged from the rest of this section.
 
 **Response `200`:**
 ```json
@@ -60,6 +63,35 @@ The endpoint end-user-facing frontends call.
 | `403` | Valid key, but request `Origin` isn't in that product's `allowed_origins` |
 | `429` | Product has exceeded `rate_limit_per_minute` |
 | `500` | Unhandled error (DB down, Anthropic API error, etc.) — body is `{"detail": "<message>"}`; don't let internals leak beyond a plain message |
+
+### `POST /chat` with `stream: true`
+
+Same request shape, `stream: true`. Response is `200 text/event-stream`.
+Each line is `data: <json>\n\n`. Two payload shapes:
+
+**Delta** (zero or more, as text becomes available):
+```json
+{ "delta": "Braxton Hicks are" }
+```
+For a cache hit, exactly **one** delta event is sent, containing the entire
+cached answer.
+
+**Terminal** (exactly one, always last):
+```json
+{ "done": true, "session_id": 42, "sources": ["Mayo-Clinic-Pregnancy-Library.md"], "cached": false }
+```
+or, only if generation failed *after* at least one delta was already sent:
+```json
+{ "done": true, "error": "<message>" }
+```
+
+**Errors that happen before any content was sent** (auth, validation,
+retrieval/cache-lookup failure, an `ANSWER_PROVIDER` that doesn't support
+streaming, or the LLM failing on its very first chunk) return a normal JSON
+error response — same status codes and body shape as the non-streaming
+`/chat` error table above, not a stream. Only a failure *after* streaming
+has genuinely started becomes the in-stream `error` payload described above,
+since the `200 text/event-stream` status is already committed by then.
 
 ## `POST /admin/products`
 

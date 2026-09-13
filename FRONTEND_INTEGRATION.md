@@ -30,7 +30,7 @@ question can occasionally take a few seconds.
 | **Auth header** | `X-API-Key` (see below — safe to hardcode in client code) |
 | **Content type** | `application/json` |
 | **Response time** | Typically 1–5s; occasionally longer or a one-off failure under upstream load (see Error handling) |
-| **Streaming** | Not supported — you get the full answer in one response |
+| **Streaming** | Supported, opt-in — set `stream: true` on the request (see below) |
 
 ## Your API key
 
@@ -76,13 +76,16 @@ not yours.
   questions may come back near-instantly (`cached: true` in the response).
   No special handling needed on your end, but it explains why some responses
   are much faster than others.
+- **Streaming** — set `stream: true` on the request and the response
+  becomes Server-Sent Events instead of one JSON body, so you can render the
+  answer as it's generated instead of waiting for the whole thing. Opt-in:
+  omit `stream` (or send `false`) and nothing changes from the default
+  behavior described above.
 - **Per-product rate limiting** — your key has a request-per-minute cap (ask
   the project owner what yours is set to). Exceeding it returns `429`.
 
 ## What it does *not* support (design around these)
 
-- **No streaming** — don't build a token-by-token typing effect; show a
-  loading state until the full response arrives.
 - **No message editing/deletion/regeneration** — every user message is
   final and appended to history server-side.
 - **No images/attachments** — text in, text out.
@@ -208,6 +211,53 @@ async function openConversation(sessionId) {
   const data = await res.json();
   localStorage.setItem("mamaroo_session_id", String(data.session_id));
   return data.messages; // [{ role, content, created_at }, ...] — render these, then continue with sendMessage()
+}
+
+async function sendMessageStreaming(text, { onDelta, onDone } = {}) {
+  const sessionId = localStorage.getItem("mamaroo_session_id");
+  const res = await fetch(CHAT_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-API-Key": CHAT_API_KEY },
+    body: JSON.stringify({
+      message: text,
+      end_user_id: getEndUserId(),
+      session_id: sessionId ? Number(sessionId) : null,
+      stream: true,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(`Chat request failed (${res.status}): ${body.detail ?? "unknown error"}`);
+  }
+
+  // EventSource doesn't support POST, so streaming is read manually via the
+  // response body's ReadableStream instead.
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let boundary;
+    while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+      const rawEvent = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      const line = rawEvent.startsWith("data: ") ? rawEvent.slice(6) : rawEvent;
+      if (!line) continue;
+      const payload = JSON.parse(line);
+
+      if (payload.delta !== undefined) {
+        onDelta?.(payload.delta);
+      } else if (payload.done) {
+        if (payload.error) throw new Error(`Streaming failed: ${payload.error}`);
+        localStorage.setItem("mamaroo_session_id", String(payload.session_id));
+        onDone?.(payload); // { session_id, sources, cached }
+      }
+    }
+  }
 }
 ```
 
