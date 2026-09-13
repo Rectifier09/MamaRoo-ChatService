@@ -26,8 +26,20 @@ BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
 ADMIN_KEY = config.ADMIN_API_KEY
 
 REAL_QUESTION = "What is Braxton Hicks?"
-REAL_QUESTION_REWORDED = "Can you explain what Braxton Hicks contractions are?"
+# Empirically verified (2026-09-13) at cosine distance 0.0101 against
+# REAL_QUESTION with the local embedding model — comfortably under
+# CACHE_MAX_DISTANCE (0.08). The previous wording ("Can you explain what
+# Braxton Hicks contractions are?") measured 0.159, roughly double the
+# threshold, so the cache-hit check below was silently unverifiable — it
+# happened to depend on an assumption about embedding similarity that was
+# never actually checked against the real model.
+REAL_QUESTION_REWORDED = "What are Braxton Hicks?"
 FOLLOWUP = "when do they usually happen?"
+# Deliberately distinct from REAL_QUESTION: qa_cache is shared across all
+# products by design (see ARCHITECTURE.md), so if this test reused
+# REAL_QUESTION, its real call would cache that answer and make the
+# dedicated cache-miss check below spuriously come back cached=true.
+ORIGIN_TEST_QUESTION = "What foods should I avoid during pregnancy?"
 
 _created_product_ids: list[int] = []
 _created_end_users: list[str] = []
@@ -123,7 +135,7 @@ def main() -> int:
     check("POST /chat disallowed origin -> 403", resp.status_code == 403)
 
     resp = retry_on_transient_503(
-        lambda: chat(origin_key, REAL_QUESTION, "smoke-good-origin", origin="https://mamaroo.app")
+        lambda: chat(origin_key, ORIGIN_TEST_QUESTION, "smoke-good-origin", origin="https://mamaroo.app")
     )
     check("POST /chat allowed origin -> 200", resp.status_code == 200, resp.text)
 
