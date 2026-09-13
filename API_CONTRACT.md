@@ -93,6 +93,15 @@ error response — same status codes and body shape as the non-streaming
 has genuinely started becomes the in-stream `error` payload described above,
 since the `200 text/event-stream` status is already committed by then.
 
+If the client disconnects mid-stream, the turn is not persisted. Both the
+`chat_messages` rows and the `qa_cache` entry are written only after generation
+finishes, so abandoning the stream while deltas are still arriving leaves no
+record of the turn (the session row itself, created before generation starts,
+remains but stays empty — and `GET /chat/sessions` excludes zero-message
+sessions). The same holds for an in-stream `{"done": true, "error": ...}`:
+nothing about that turn is persisted, so a client should treat it exactly like
+a failed non-streaming request that simply happened to fail mid-answer.
+
 ## `POST /admin/products`
 
 Provisions a new product (tenant) and its API key. Not called by end-user frontends —

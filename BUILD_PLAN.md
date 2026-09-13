@@ -140,4 +140,7 @@ Don't build these unless asked — they're deferred on purpose, not overlooked:
   explicitly ruled out — see `ARCHITECTURE.md`).
 - Multi-admin roles/permissions — one shared `ADMIN_API_KEY` is the whole admin model
   for now.
-- Streaming responses (`/chat` returns the full answer in one response).
+- ~~Streaming responses~~ — **no longer a non-goal: shipped.** `POST /chat` accepts
+  `stream: true` and responds with Server-Sent Events (see `API_CONTRACT.md`). The
+  default is still one JSON response, so omitting `stream` behaves exactly as this
+  plan originally described.

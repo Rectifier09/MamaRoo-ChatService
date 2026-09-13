@@ -102,17 +102,38 @@ REWRITE_PROVIDER  # defaults to LLM_PROVIDER
 ANSWER_PROVIDER   # defaults to LLM_PROVIDER
 ```
 
-`llm_provider.py` ships two implementations — `AnthropicProvider` (default) and
-`OpenAIProvider` — proving the abstraction actually works, not just that it's
-theoretically pluggable. Both take the same `complete(system, messages, model,
-max_tokens)` shape; `system` is a list of `SystemBlock(text, cacheable)` so each
+`llm_provider.py` ships four implementations — `AnthropicProvider`, `OpenAIProvider`,
+`GeminiProvider`, and `GroqProvider` — proving the abstraction actually works, not
+just that it's theoretically pluggable. All take the same `complete(system, messages,
+model, max_tokens)` shape; `system` is a list of `SystemBlock(text, cacheable)` so each
 provider can apply its own caching approach (or none) without the caller needing to
 know which provider is active.
 
-**Adding a third provider** (Gemini, a self-hosted model behind an OpenAI-compatible
+Because each provider is an independent quota pool, `REWRITE_PROVIDER` and
+`ANSWER_PROVIDER` can be hotswitched independently when one vendor's free tier runs
+out — which is exactly what happened on 2026-09-13, when Gemini's free-tier daily cap
+was exhausted and both roles were pointed at Groq (see the comment in `.env`). One
+caveat to record while that hotswitch is in place: `GeminiProvider.stream_complete()`
+has been verified by code review only — it is structurally identical to the already
+live-proven `complete()` method, including the `thinking_budget=0` fix without which a
+Gemini 2.5+ model can spend the whole `max_output_tokens` budget on reasoning and emit
+no visible text — but it has **not** been exercised against the live Gemini API,
+because the daily quota was exhausted during this work. Streaming via the Gemini
+hotswitch is therefore code-reviewed but not live-verified as of this writing;
+streaming on Groq is live-verified end to end by `tests/smoke_test.py`.
+
+**Adding another provider** (a self-hosted model behind an OpenAI-compatible
 gateway, etc.) means writing one class with a `complete()` method and registering it
 in `llm_provider._PROVIDERS` — nothing in `rewrite.py`, `rag_engine.py`, or `app.py`
-needs to change. Two things to get right when adding one:
+needs to change. `complete()` is the only *required* method; a provider may
+additionally implement `stream_complete(system, messages, model, max_tokens) ->
+Iterator[str]` to serve `POST /chat` with `stream: true`. That's an optional,
+duck-typed capability (`hasattr`-checked by
+`rag_engine.answer_provider_supports_streaming()`, declared for readers as the
+`StreamingLLMProvider` Protocol in `llm_provider.py`), deliberately not part of the
+required surface: `AnthropicProvider` omits it, and a provider that omits it simply
+returns a clean JSON `500` for `stream: true` requests while non-streaming requests
+keep working normally. Two things to get right when adding one:
 - `messages` here only ever contains plain `{"role": "user"/"assistant", "content": str}`
   entries (no tool calls, no images) — if a new provider's SDK wants a different
   message shape, translate it inside that provider's `complete()`, not upstream.

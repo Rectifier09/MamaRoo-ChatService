@@ -30,7 +30,7 @@ question can occasionally take a few seconds.
 | **Auth header** | `X-API-Key` (see below — safe to hardcode in client code) |
 | **Content type** | `application/json` |
 | **Response time** | Typically 1–5s; occasionally longer or a one-off failure under upstream load (see Error handling) |
-| **Streaming** | Supported, opt-in — set `stream: true` on the request (see below) |
+| **Streaming** | Supported, opt-in — set `stream: true` on the request (see [Streaming responses](#streaming-responses)) |
 
 ## Your API key
 
@@ -89,8 +89,9 @@ not yours.
 - **No message editing/deletion/regeneration** — every user message is
   final and appended to history server-side.
 - **No images/attachments** — text in, text out.
-- **No typing indicators or partial results from the server** — build your
-  own loading UI.
+- **No server-side typing indicator** — the API has no "user is typing"
+  concept, so any thinking/typing affordance is yours to build. (Partial
+  results *are* available — see [Streaming responses](#streaming-responses).)
 
 ## The endpoint
 
@@ -115,6 +116,7 @@ X-API-Key: pk_LuWWNp6ExBUBcwMSMrJAHBrn5mFP8jTF
 | `message` | string | yes | The user's message. Must not be empty/whitespace-only. |
 | `end_user_id` | string | yes | A stable identifier for this browser/user — a real logged-in user ID if you have auth, otherwise a client-generated UUID persisted in `localStorage`. Never sent to any LLM; used only to scope conversation history. |
 | `session_id` | integer or `null` | yes (send `null` if starting fresh) | Omit/`null` to start a new conversation. Send back the `session_id` from a prior response to continue it. |
+| `stream` | boolean | no (default `false`) | `true` switches the response to Server-Sent Events so you can render the answer as it's generated — see [Streaming responses](#streaming-responses) below. Omit it and everything on this page applies unchanged. |
 
 **Success response — `200`**
 ```json
@@ -140,6 +142,49 @@ X-API-Key: pk_LuWWNp6ExBUBcwMSMrJAHBrn5mFP8jTF
 | `403` | Key valid but your page's origin isn't allow-listed for it | Same as above — a config problem to fix with the project owner, not a user-facing state. |
 | `429` | Rate limit exceeded | Show something friendly like "Too many questions at once — try again in a moment," not the raw error. |
 | `500` | Unhandled error (DB issue, LLM provider hiccup, etc.) | **Retry once automatically** after a short delay (1–2s) — a fraction of these are transient upstream LLM overload, not real failures. If it fails twice, show a generic "something went wrong, please try again." |
+
+### Streaming responses
+
+Send `"stream": true` in the request body and the response is
+`200 text/event-stream` instead of a single JSON body. Everything else — the
+headers you send, auth, `session_id` semantics, caching — is identical.
+Each event is one line of the form `data: <json>\n\n`, and there are exactly
+two payload shapes:
+
+**Delta** — zero or more, in order, as text is generated. Append each one to
+what you've rendered so far:
+```json
+{ "delta": "Braxton Hicks are" }
+```
+On a cache hit you get exactly **one** delta containing the whole answer, so
+don't assume many small chunks.
+
+**Terminal** — exactly one, always last. Either success:
+```json
+{ "done": true, "session_id": 42, "sources": ["Mayo-Clinic-Pregnancy-Library.md"], "cached": false }
+```
+or failure:
+```json
+{ "done": true, "error": "<message>" }
+```
+
+Handling the error form: **the turn was not saved server-side** when this
+arrives. Neither the user's message nor the partial answer is persisted, and
+the `session_id` you already have (if any) is still valid. So treat it exactly
+like a failed non-streaming request that happened to fail mid-answer: discard
+the partial text you rendered (or mark it clearly as incomplete), show the same
+generic "something went wrong, please try again" copy as a `500`, and let the
+user resend. Don't show the raw `error` string. The same applies if the
+connection drops mid-stream without any terminal event — nothing was persisted.
+
+**Errors before streaming starts** (bad key, disallowed origin, empty message,
+rate limit, or a failure before the first delta) come back as a normal JSON
+error response with the same status codes as the table above — *not* as a
+stream. That's why the reference implementation below checks `res.ok` before it
+starts reading the body.
+
+The canonical version of this schema lives in `API_CONTRACT.md` (backend repo);
+this section mirrors it.
 
 ### `GET /health`
 No auth, no body. Returns `{"status": "ok"}`. Useful for an uptime check, not
@@ -261,10 +306,13 @@ async function sendMessageStreaming(text, { onDelta, onDone } = {}) {
 }
 ```
 
-A working, already-tested example of this exact flow (with a full chat UI,
-loading state, error display, and a "New chat" button) lives at
+A working, already-tested example of the **non-streaming** flow (with a full
+chat UI, loading state, error display, and a "New chat" button) lives at
 `tools/chat-tester.html` in the backend repo if you have access to it — open
 it directly in a browser, no build step, to see the whole thing running live.
+Note that it does not implement streaming: for `stream: true`, the
+`sendMessageStreaming()` function above is the reference, and the backend's
+own `tests/smoke_test.py` is what exercises the streaming path end to end.
 
 ## UX recommendations
 
