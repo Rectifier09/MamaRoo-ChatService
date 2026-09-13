@@ -181,6 +181,33 @@ class GeminiProvider:
         )
         return response.text or ""
 
+    def stream_complete(self, system, messages, model, max_tokens):
+        from google.genai import types
+
+        system_text = "\n\n".join(block.text for block in system)
+        contents = [
+            types.Content(
+                role="model" if m["role"] == "assistant" else "user",
+                parts=[types.Part.from_text(text=m["content"])],
+            )
+            for m in messages
+        ]
+        stream = self._client.models.generate_content_stream(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_text,
+                max_output_tokens=max_tokens,
+                # Same thinking-budget issue as complete() above applies to
+                # streaming too -- without this, a chunk can arrive with
+                # thinking content and no visible text.
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        for chunk in stream:
+            if chunk.text:
+                yield chunk.text
+
 
 _PROVIDERS = {
     "anthropic": AnthropicProvider,
