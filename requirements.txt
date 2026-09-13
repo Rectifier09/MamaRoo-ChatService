@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+anthropic
+openai
+google-genai
+psycopg[binary]
+psycopg-pool
+pgvector
+sentence-transformers
+pypdf
+python-dotenv
+pydantic
