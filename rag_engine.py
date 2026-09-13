@@ -70,3 +70,53 @@ def generate_answer(message: str, history: list[dict] | None = None) -> tuple[st
 
     cache.store_answer(canonical, query_embedding, answer, sources)
     return answer, sources, False
+
+
+def answer_provider_supports_streaming() -> bool:
+    return hasattr(get_provider(config.ANSWER_PROVIDER), "stream_complete")
+
+
+def generate_answer_stream(message: str, history: list[dict] | None = None):
+    """Yields ("delta", str) tuples as answer text becomes available, then
+    exactly one ("done", dict): {"sources": [...], "cached": bool} on
+    success, or {"error": str} if generation failed after streaming began.
+    Exceptions from rewrite/embed/cache-lookup/retrieve are NOT caught here
+    -- they propagate out of the generator's first next() call so the caller
+    can distinguish "failed before anything was sent" from "failed mid-
+    stream" (see app.py)."""
+    canonical = rewrite_query(message, history)
+    query_embedding = embed_texts([canonical])[0]
+
+    cached = cache.find_cached_answer(query_embedding)
+    if cached:
+        yield "delta", cached["answer"]
+        yield "done", {"sources": list(cached["sources"]), "cached": True}
+        return
+
+    chunks = retrieve(query_embedding)
+    system = [
+        SystemBlock(text=SYSTEM_INSTRUCTIONS, cacheable=True),
+        SystemBlock(text=_build_context(chunks), cacheable=False),
+    ]
+
+    messages = list(history or [])
+    messages.append({"role": "user", "content": message})
+
+    provider = get_provider(config.ANSWER_PROVIDER)
+    sources = sorted({meta.get("source") for _, meta in chunks})
+    full_answer = ""
+    try:
+        for delta in provider.stream_complete(
+            system=system,
+            messages=messages,
+            model=config.ANSWER_MODEL,
+            max_tokens=config.MAX_TOKENS,
+        ):
+            full_answer += delta
+            yield "delta", delta
+    except Exception as exc:
+        yield "done", {"error": str(exc)}
+        return
+
+    cache.store_answer(canonical, query_embedding, full_answer, sources)
+    yield "done", {"sources": sources, "cached": False}
