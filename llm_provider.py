@@ -12,9 +12,19 @@ To add another provider:
     2. Otherwise, write a class with its own `complete(system, messages, model,
        max_tokens) -> str` method from scratch (see AnthropicProvider, GeminiProvider).
     3. Either way, add the class to _PROVIDERS below and its API key to config.py.
-That's the whole integration surface — nothing in rewrite.py or rag_engine.py needs
-to know it exists.
+`complete()` is the whole *required* integration surface — nothing in rewrite.py or
+rag_engine.py needs to know the class exists.
+
+Optionally, a provider MAY also implement `stream_complete(system, messages, model,
+max_tokens) -> Iterator[str]`, yielding answer text incrementally, to serve
+`POST /chat` requests with `stream: true` (see StreamingLLMProvider below). This is
+a duck-typed capability, discovered at runtime via `hasattr` — see
+rag_engine.answer_provider_supports_streaming(). Omitting it is a supported choice
+(AnthropicProvider deliberately omits it): that provider simply can't serve
+`stream: true`, which app.py turns into a clean JSON 500 ("Provider 'x' does not
+support streaming"), not a crash, and leaves non-streaming requests unaffected.
 """
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -31,9 +41,33 @@ class SystemBlock:
 
 
 class LLMProvider(Protocol):
+    """The required provider surface: one `complete()` method. Every entry in
+    _PROVIDERS satisfies this."""
+
     def complete(
         self, system: list[SystemBlock], messages: list[dict], model: str, max_tokens: int
     ) -> str:
+        ...
+
+
+class StreamingLLMProvider(LLMProvider, Protocol):
+    """The *optional* extra surface a provider may implement on top of LLMProvider:
+    incremental generation for `POST /chat` with `stream: true`.
+
+    Deliberately a separate Protocol rather than a method on LLMProvider — not every
+    provider implements it (AnthropicProvider doesn't), and folding it into
+    LLMProvider would make those providers fail a type check for a capability they
+    are allowed to skip. Nothing annotates against this Protocol today; the
+    capability is checked at runtime by duck typing
+    (`hasattr(provider, "stream_complete")` — see
+    rag_engine.answer_provider_supports_streaming). This class exists so the
+    optional capability, and its exact signature, are declared in one obvious place
+    for anyone adding a provider.
+    """
+
+    def stream_complete(
+        self, system: list[SystemBlock], messages: list[dict], model: str, max_tokens: int
+    ) -> Iterator[str]:
         ...
 
 
@@ -113,6 +147,12 @@ class _OpenAICompatibleProvider:
             stream=True,
         )
         for chunk in stream:
+            # Some OpenAI-compatible gateways end the stream with a bookkeeping
+            # chunk that carries no choices at all (usage stats only). Indexing
+            # [0] on that raises IndexError and turns a completion that actually
+            # succeeded into a terminal error event -- skip it instead.
+            if not chunk.choices:
+                continue
             delta = chunk.choices[0].delta.content
             if delta:
                 yield delta
