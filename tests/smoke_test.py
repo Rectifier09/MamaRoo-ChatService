@@ -16,6 +16,12 @@ used to provision throwaway test products, which are deleted again at the end.
 Also covers GET /chat/sessions (list) and GET /chat/sessions/{id}/messages
 (detail): thread listing/ordering/titles, cross-user isolation, and
 zero-message-session exclusion.
+
+Streaming (`stream: true`) coverage: the happy path over HTTP (cache miss,
+cache hit, multi-turn, persistence), pre-stream error parity with the
+non-streaming path, and — in-process against the real generator — the
+post-first-delta failure paths that can't be triggered against a live server
+(see check_post_delta_failure_paths).
 """
 import json
 import sys
@@ -96,16 +102,30 @@ def retry_on_transient_503(fn, attempts: int = 3, delay: float = 8.0):
     return resp
 
 
-def chat_stream(api_key: str, message: str, end_user_id: str, session_id: int | None = None):
+def chat_stream(
+    api_key: str,
+    message: str,
+    end_user_id: str,
+    session_id: int | None = None,
+    origin: str | None = None,
+):
     """POSTs to /chat with stream=true and reads the SSE response. Returns
-    (events, status_code) -- events is every parsed `data:` JSON payload in
-    order; empty if the response was a pre-stream JSON error instead."""
+    (events, status_code, body_text) -- events is every parsed `data:` JSON
+    payload in order (empty if the response was a pre-stream JSON error
+    instead), and body_text is the raw error body on a non-200 (empty string
+    on a 200, where the payloads are in `events`). The body is returned, not
+    discarded, because retry_on_transient_503_stream below needs it: a
+    pre-stream provider 503 is a plain JSON body with no SSE events at all, so
+    checking `events` for it could never match."""
     _created_end_users.append(end_user_id)
+    headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
+    if origin:
+        headers["Origin"] = origin
     events = []
     with httpx.stream(
         "POST",
         f"{BASE_URL}/chat",
-        headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+        headers=headers,
         json={
             "message": message,
             "end_user_id": end_user_id,
@@ -116,24 +136,131 @@ def chat_stream(api_key: str, message: str, end_user_id: str, session_id: int | 
     ) as resp:
         status_code = resp.status_code
         if status_code != 200:
-            resp.read()
-            return events, status_code
+            return events, status_code, resp.read().decode()
         for line in resp.iter_lines():
             if line.startswith("data: "):
                 events.append(json.loads(line[len("data: ") :]))
-    return events, status_code
+    return events, status_code, ""
 
 
 def retry_on_transient_503_stream(fn, attempts: int = 3, delay: float = 8.0):
-    """Same retry logic as retry_on_transient_503, adapted for chat_stream's
-    (events, status_code) return shape instead of an httpx.Response."""
-    events, status = fn()
+    """Same retry logic (and same semantics: retry only on 500 + UNAVAILABLE)
+    as retry_on_transient_503, adapted for chat_stream's (events, status_code,
+    body_text) return shape instead of an httpx.Response."""
+    events, status, body = fn()
     tries = 1
-    while status == 500 and any("UNAVAILABLE" in str(e) for e in events) and tries < attempts:
+    while status == 500 and "UNAVAILABLE" in body and tries < attempts:
         time.sleep(delay)
-        events, status = fn()
+        events, status, body = fn()
         tries += 1
-    return events, status
+    return events, status, body
+
+
+def check_post_delta_failure_paths() -> None:
+    """Exercises generate_answer_stream's post-first-delta failure paths directly,
+    in-process, against the real generator, the real DB and (for the cache-write
+    case) a real Groq stream.
+
+    Why in-process rather than over HTTP: these paths need a failure injected at
+    a specific point mid-generation. The live server is a separate process, so
+    there is no way to make a real Groq stream fail on demand after N chunks, and
+    no reliable way to make a real DB write fail without breaking every other
+    check in this file. Injecting the failure into the real generator here tests
+    the actual code app.py drives -- only the failure trigger is synthetic, not
+    the code under test. The counterpart in app.py's event_stream (the terminal
+    event it emits when a persist fails) is the same two-line pattern.
+
+    Must run while qa_cache is empty -- a cache hit would short-circuit
+    generate_answer_stream before it ever reaches the provider.
+    """
+    # Imported here rather than at module scope: importing rag_engine loads the
+    # local embedding model (sentence-transformers/torch), several seconds of
+    # startup cost that only these three checks need.
+    import cache as cache_module
+    import llm_provider
+    import rag_engine
+
+    def cache_rows() -> int:
+        return db.fetchone("SELECT count(*) AS n FROM qa_cache")["n"]
+
+    provider = llm_provider.get_provider(config.ANSWER_PROVIDER)
+
+    # --- (a) provider raises AFTER real deltas were already yielded ---
+    def exploding_stream(**kwargs):
+        yield "Braxton Hicks "
+        yield "contractions are "
+        raise RuntimeError("simulated mid-stream provider failure")
+
+    before = cache_rows()
+    provider.stream_complete = exploding_stream
+    try:
+        events = list(rag_engine.generate_answer_stream("What is a birth plan?"))
+    finally:
+        del provider.stream_complete  # unshadow the real bound method
+
+    deltas = [payload for kind, payload in events if kind == "delta"]
+    dones = [payload for kind, payload in events if kind == "done"]
+    check(
+        "mid-stream provider failure: deltas delivered, then exactly one terminal error event",
+        len(deltas) == 2
+        and len(dones) == 1
+        and events[-1][0] == "done"
+        and "simulated mid-stream provider failure" in dones[0].get("error", ""),
+        str(events),
+    )
+    check(
+        "mid-stream provider failure: nothing written to qa_cache",
+        cache_rows() == before,
+        f"{before} -> {cache_rows()}",
+    )
+
+    # --- (b) provider completes cleanly but yields zero chunks ---
+    def empty_stream(**kwargs):
+        return iter(())
+
+    before = cache_rows()
+    provider.stream_complete = empty_stream
+    try:
+        events = list(rag_engine.generate_answer_stream("What is a doula?"))
+    finally:
+        del provider.stream_complete
+
+    deltas = [payload for kind, payload in events if kind == "delta"]
+    dones = [payload for kind, payload in events if kind == "done"]
+    check(
+        "zero-delta generation -> error done event, not a success done event",
+        len(deltas) == 0 and len(dones) == 1 and "error" in dones[0],
+        str(events),
+    )
+    check(
+        "zero-delta generation does not cache an empty answer",
+        cache_rows() == before,
+        f"{before} -> {cache_rows()} (an empty cached answer would poison the shared "
+        "qa_cache for the non-streaming path too)",
+    )
+
+    # --- (c) the cache write itself fails after a real, complete Groq stream ---
+    original_store = cache_module.store_answer
+
+    def exploding_store(*args, **kwargs):
+        raise RuntimeError("simulated cache-write failure")
+
+    cache_module.store_answer = exploding_store
+    try:
+        events = list(rag_engine.generate_answer_stream(REAL_QUESTION))
+    finally:
+        cache_module.store_answer = original_store
+
+    deltas = [payload for kind, payload in events if kind == "delta"]
+    dones = [payload for kind, payload in events if kind == "done"]
+    check(
+        "cache-write failure after a real stream still yields exactly one terminal error event",
+        len(deltas) >= 1
+        and len(dones) == 1
+        and events[-1][0] == "done"
+        and "simulated cache-write failure" in dones[0].get("error", ""),
+        str(events)[:500],
+    )
 
 
 def main() -> int:
@@ -217,6 +344,31 @@ def main() -> int:
         "rate limit enforced (3rd request in same minute -> 429)",
         r3.status_code == 429,
         f"r1={r1.status_code} r2={r2.status_code} r3={r3.status_code}",
+    )
+
+    # --- streaming: pre-stream errors behave identically to non-streaming ---
+    # API_CONTRACT.md's SSE section promises that stream:true changes nothing
+    # about pre-stream error behavior -- same status codes, same JSON body
+    # shape, never a stream. Checked here (rather than down in the streaming
+    # section) so the 429 case can reuse ratelimit_key's already-exhausted
+    # window: a request that gets 429'd is rejected before the limiter records
+    # it, so this adds nothing to that key's counters.
+    _, empty_status, _ = chat_stream(main_key, "   ", "smoke-stream-empty-msg")
+    check("POST /chat stream=true empty message -> 400 (same as non-streaming)", empty_status == 400)
+
+    _, badkey_status, _ = chat_stream("pk_invalid_xyz", "hi", "smoke-stream-bad-key")
+    check("POST /chat stream=true wrong API key -> 401 (same as non-streaming)", badkey_status == 401)
+
+    _, badorigin_status, _ = chat_stream(
+        origin_key, "hi", "smoke-stream-bad-origin", origin="https://not-allowed.example.com"
+    )
+    check("POST /chat stream=true disallowed origin -> 403 (same as non-streaming)", badorigin_status == 403)
+
+    _, ratelimited_status, _ = chat_stream(ratelimit_key, "ping four", "smoke-stream-ratelimit")
+    check(
+        "POST /chat stream=true over rate limit -> 429 (same as non-streaming)",
+        ratelimited_status == 429,
+        f"got {ratelimited_status}",
     )
 
     # --- session listing ---
@@ -310,6 +462,9 @@ def main() -> int:
     # Clear qa_cache before testing streaming behavior, so cache miss test is unambiguous
     db.execute("DELETE FROM qa_cache")
 
+    # --- streaming: post-first-delta failure paths (in-process, see docstring) ---
+    check_post_delta_failure_paths()
+
     # --- streaming: regression check, stream explicitly false ---
     regress_resp = httpx.post(
         f"{BASE_URL}/chat",
@@ -326,10 +481,10 @@ def main() -> int:
 
     # --- streaming: cache miss ---
     stream_user = "smoke-stream"
-    events, status = retry_on_transient_503_stream(
+    events, status, body = retry_on_transient_503_stream(
         lambda: chat_stream(main_key, REAL_QUESTION, stream_user)
     )
-    check("POST /chat stream=true cache miss -> 200", status == 200, str(events))
+    check("POST /chat stream=true cache miss -> 200", status == 200, str(events) + body)
     deltas = [e["delta"] for e in events if "delta" in e]
     done_events = [e for e in events if e.get("done")]
     check("stream cache miss: at least one delta event", len(deltas) >= 1, str(events))
@@ -344,8 +499,8 @@ def main() -> int:
     full_streamed_answer = "".join(deltas)
 
     # --- streaming: cache hit (same question again) -> exactly one delta ---
-    events2, status2 = chat_stream(main_key, REAL_QUESTION, stream_user)
-    check("POST /chat stream=true cache hit -> 200", status2 == 200, str(events2))
+    events2, status2, body2 = chat_stream(main_key, REAL_QUESTION, stream_user)
+    check("POST /chat stream=true cache hit -> 200", status2 == 200, str(events2) + body2)
     deltas2 = [e["delta"] for e in events2 if "delta" in e]
     done_events2 = [e for e in events2 if e.get("done")]
     check(
@@ -360,10 +515,10 @@ def main() -> int:
     )
 
     # --- streaming: multi-turn follow-up still resolves via rewrite ---
-    events3, status3 = retry_on_transient_503_stream(
+    events3, status3, body3 = retry_on_transient_503_stream(
         lambda: chat_stream(main_key, FOLLOWUP, stream_user, session_id=stream_session_id)
     )
-    check("POST /chat stream=true multi-turn -> 200", status3 == 200, str(events3))
+    check("POST /chat stream=true multi-turn -> 200", status3 == 200, str(events3) + body3)
     followup_answer = "".join(e["delta"] for e in events3 if "delta" in e).lower()
     check(
         "stream multi-turn follow-up resolves against history",
