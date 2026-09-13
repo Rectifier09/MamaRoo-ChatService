@@ -103,6 +103,20 @@ class _OpenAICompatibleProvider:
         )
         return response.choices[0].message.content or ""
 
+    def stream_complete(self, system, messages, model, max_tokens):
+        system_text = "\n\n".join(block.text for block in system)
+        full_messages = [{"role": "system", "content": system_text}, *messages]
+        stream = self._client.chat.completions.create(
+            model=model,
+            max_completion_tokens=max_tokens,
+            messages=full_messages,
+            stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+
 
 class OpenAIProvider(_OpenAICompatibleProvider):
     """Reference second implementation — proves the abstraction is real, not just
