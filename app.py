@@ -3,9 +3,10 @@ Run with:
     uvicorn app:app --reload --port 8000
 """
 import secrets
+from datetime import datetime
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -53,6 +54,34 @@ class CreateProductResponse(BaseModel):
     api_key: str
 
 
+class SessionSummary(BaseModel):
+    session_id: int
+    title: str
+    last_message_at: datetime
+    created_at: datetime
+
+
+class SessionListResponse(BaseModel):
+    sessions: List[SessionSummary]
+
+
+class MessageItem(BaseModel):
+    role: str
+    content: str
+    created_at: datetime
+
+
+class SessionMessagesResponse(BaseModel):
+    session_id: int
+    messages: List[MessageItem]
+
+
+def _truncate_title(text: str, max_len: int = 80) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1].rstrip() + "…"
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -94,6 +123,43 @@ def chat(req: ChatRequest, product: dict = Depends(get_product)):
     )
 
     return ChatResponse(answer=answer, sources=sources, session_id=session_id, cached=cached)
+
+
+@app.get("/chat/sessions", response_model=SessionListResponse)
+def list_sessions(
+    end_user_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    product: dict = Depends(get_product),
+):
+    rows = db.fetchall(
+        """
+        SELECT
+          s.id AS session_id,
+          (SELECT content FROM chat_messages
+           WHERE session_id = s.id AND role = 'user'
+           ORDER BY id LIMIT 1) AS title_raw,
+          (SELECT MAX(created_at) FROM chat_messages WHERE session_id = s.id) AS last_message_at,
+          s.created_at
+        FROM chat_sessions s
+        WHERE s.product_id = %s
+          AND s.end_user_id = %s
+          AND EXISTS (SELECT 1 FROM chat_messages WHERE session_id = s.id)
+        ORDER BY last_message_at DESC
+        LIMIT %s OFFSET %s
+        """,
+        (product["id"], end_user_id, limit, offset),
+    )
+    sessions = [
+        SessionSummary(
+            session_id=r["session_id"],
+            title=_truncate_title(r["title_raw"]),
+            last_message_at=r["last_message_at"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
+    return SessionListResponse(sessions=sessions)
 
 
 @app.post("/admin/products", response_model=CreateProductResponse)
