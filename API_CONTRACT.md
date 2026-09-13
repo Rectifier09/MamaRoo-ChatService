@@ -101,6 +101,79 @@ lost, provision a new product entry rather than trying to recover the old key.
 |---|---|
 | `401` | `X-Admin-Key` missing or incorrect |
 
+## `GET /chat/sessions`
+
+Lists an end user's past conversations, most recently active first.
+
+**Headers:**
+| Header | Required | Notes |
+|---|---|---|
+| `X-API-Key` | Yes | Same as `/chat`. |
+
+**Query params:**
+| Param | Required | Notes |
+|---|---|---|
+| `end_user_id` | Yes | Same identifier used in `POST /chat`. |
+| `limit` | No | Default 20, max 100. |
+| `offset` | No | Default 0. |
+
+**Response `200`:**
+```json
+{
+  "sessions": [
+    {
+      "session_id": 42,
+      "title": "What is Braxton Hicks?",
+      "last_message_at": "2026-09-13T11:35:55Z",
+      "created_at": "2026-09-13T11:35:38Z"
+    }
+  ]
+}
+```
+- `title` — the session's first user message, truncated to 80 characters with
+  a trailing `…` if truncated.
+- Sessions with zero messages (e.g. from a failed `/chat` request) are never
+  included.
+- Empty `sessions: []` if the user has no conversations — not an error.
+
+**Error responses:**
+| Status | Condition |
+|---|---|
+| `401` | `X-API-Key` missing or invalid |
+| `422` | `end_user_id` missing |
+
+## `GET /chat/sessions/{session_id}/messages`
+
+Fetches one conversation's full message history, in order.
+
+**Headers:**
+| Header | Required | Notes |
+|---|---|---|
+| `X-API-Key` | Yes | Same as `/chat`. |
+
+**Query params:**
+| Param | Required | Notes |
+|---|---|---|
+| `end_user_id` | Yes | Must match the session's actual owner, or this returns `404`. |
+
+**Response `200`:**
+```json
+{
+  "session_id": 42,
+  "messages": [
+    { "role": "user", "content": "What is Braxton Hicks?", "created_at": "2026-09-13T11:35:38Z" },
+    { "role": "assistant", "content": "Braxton Hicks are...", "created_at": "2026-09-13T11:35:41Z" }
+  ]
+}
+```
+
+**Error responses:**
+| Status | Condition |
+|---|---|
+| `401` | `X-API-Key` missing or invalid |
+| `404` | Session doesn't exist, or doesn't belong to the given `end_user_id` under this product — both cases return the same `404`, deliberately, so a client can't distinguish "wrong ID" from "not yours." |
+| `422` | `end_user_id` missing |
+
 ## Example: minimal browser integration
 
 ```js

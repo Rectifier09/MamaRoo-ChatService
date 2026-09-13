@@ -67,6 +67,11 @@ not yours.
   `(your API key, end_user_id)`. A returning user with the same
   `end_user_id` retains their session if you keep passing the same
   `session_id`.
+- **Browse past conversations** — `GET /chat/sessions` lists a user's past
+  conversations (most recent first, with a title from the first message);
+  `GET /chat/sessions/{session_id}/messages` fetches one conversation's full
+  history to render when the user reopens it. Use this to rebuild a
+  conversation list after `localStorage` is cleared or on a new device.
 - **Response caching (transparent to you)** — semantically similar repeat
   questions may come back near-instantly (`cached: true` in the response).
   No special handling needed on your end, but it explains why some responses
@@ -78,11 +83,6 @@ not yours.
 
 - **No streaming** — don't build a token-by-token typing effect; show a
   loading state until the full response arrives.
-- **No conversation list / history browsing endpoint** — the API only
-  continues *one* conversation via `session_id`. If your product wants
-  multiple named chat threads, that's a frontend-only concept (you manage
-  multiple `session_id`s yourself); there's no server endpoint to list or
-  fetch past sessions.
 - **No message editing/deletion/regeneration** — every user message is
   final and appended to history server-side.
 - **No images/attachments** — text in, text out.
@@ -186,6 +186,28 @@ async function sendMessage(text, { retry = true } = {}) {
 
 function startNewConversation() {
   localStorage.removeItem("mamaroo_session_id");
+}
+
+async function listConversations() {
+  const res = await fetch(
+    `${CHAT_API_URL.replace("/chat", "/chat/sessions")}?end_user_id=${encodeURIComponent(getEndUserId())}`,
+    { headers: { "X-API-Key": CHAT_API_KEY } },
+  );
+  if (!res.ok) throw new Error(`Failed to list conversations (${res.status})`);
+  const data = await res.json();
+  return data.sessions; // [{ session_id, title, last_message_at, created_at }, ...]
+}
+
+async function openConversation(sessionId) {
+  const res = await fetch(
+    `${CHAT_API_URL.replace("/chat", "/chat/sessions")}/${sessionId}/messages?end_user_id=${encodeURIComponent(getEndUserId())}`,
+    { headers: { "X-API-Key": CHAT_API_KEY } },
+  );
+  if (res.status === 404) throw new Error("Conversation not found");
+  if (!res.ok) throw new Error(`Failed to load conversation (${res.status})`);
+  const data = await res.json();
+  localStorage.setItem("mamaroo_session_id", String(data.session_id));
+  return data.messages; // [{ role, content, created_at }, ...] — render these, then continue with sendMessage()
 }
 ```
 
