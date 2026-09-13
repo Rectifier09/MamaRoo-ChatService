@@ -17,6 +17,7 @@ Also covers GET /chat/sessions (list) and GET /chat/sessions/{id}/messages
 (detail): thread listing/ordering/titles, cross-user isolation, and
 zero-message-session exclusion.
 """
+import json
 import sys
 import time
 
@@ -93,6 +94,46 @@ def retry_on_transient_503(fn, attempts: int = 3, delay: float = 8.0):
         resp = fn()
         tries += 1
     return resp
+
+
+def chat_stream(api_key: str, message: str, end_user_id: str, session_id: int | None = None):
+    """POSTs to /chat with stream=true and reads the SSE response. Returns
+    (events, status_code) -- events is every parsed `data:` JSON payload in
+    order; empty if the response was a pre-stream JSON error instead."""
+    _created_end_users.append(end_user_id)
+    events = []
+    with httpx.stream(
+        "POST",
+        f"{BASE_URL}/chat",
+        headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+        json={
+            "message": message,
+            "end_user_id": end_user_id,
+            "session_id": session_id,
+            "stream": True,
+        },
+        timeout=60,
+    ) as resp:
+        status_code = resp.status_code
+        if status_code != 200:
+            resp.read()
+            return events, status_code
+        for line in resp.iter_lines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[len("data: ") :]))
+    return events, status_code
+
+
+def retry_on_transient_503_stream(fn, attempts: int = 3, delay: float = 8.0):
+    """Same retry logic as retry_on_transient_503, adapted for chat_stream's
+    (events, status_code) return shape instead of an httpx.Response."""
+    events, status = fn()
+    tries = 1
+    while status == 500 and any("UNAVAILABLE" in str(e) for e in events) and tries < attempts:
+        time.sleep(delay)
+        events, status = fn()
+        tries += 1
+    return events, status
 
 
 def main() -> int:
@@ -264,6 +305,85 @@ def main() -> int:
         "GET /chat/sessions excludes sessions with zero messages",
         empty_list_resp.status_code == 200 and empty_list_resp.json().get("sessions") == [],
         empty_list_resp.text,
+    )
+
+    # Clear qa_cache before testing streaming behavior, so cache miss test is unambiguous
+    db.execute("DELETE FROM qa_cache")
+
+    # --- streaming: regression check, stream explicitly false ---
+    regress_resp = httpx.post(
+        f"{BASE_URL}/chat",
+        headers={"X-API-Key": main_key, "Content-Type": "application/json"},
+        json={"message": "hi", "end_user_id": "smoke-stream-regress", "session_id": None, "stream": False},
+        timeout=30,
+    )
+    _created_end_users.append("smoke-stream-regress")
+    check(
+        "POST /chat stream=false -> normal JSON shape unchanged",
+        regress_resp.status_code == 200 and "answer" in regress_resp.json() and "delta" not in regress_resp.text,
+        regress_resp.text,
+    )
+
+    # --- streaming: cache miss ---
+    stream_user = "smoke-stream"
+    events, status = retry_on_transient_503_stream(
+        lambda: chat_stream(main_key, REAL_QUESTION, stream_user)
+    )
+    check("POST /chat stream=true cache miss -> 200", status == 200, str(events))
+    deltas = [e["delta"] for e in events if "delta" in e]
+    done_events = [e for e in events if e.get("done")]
+    check("stream cache miss: at least one delta event", len(deltas) >= 1, str(events))
+    check(
+        "stream cache miss: exactly one done event, cached=false, real sources",
+        len(done_events) == 1
+        and done_events[0].get("cached") is False
+        and len(done_events[0].get("sources", [])) > 0,
+        str(done_events),
+    )
+    stream_session_id = done_events[0].get("session_id") if done_events else None
+    full_streamed_answer = "".join(deltas)
+
+    # --- streaming: cache hit (same question again) -> exactly one delta ---
+    events2, status2 = chat_stream(main_key, REAL_QUESTION, stream_user)
+    check("POST /chat stream=true cache hit -> 200", status2 == 200, str(events2))
+    deltas2 = [e["delta"] for e in events2 if "delta" in e]
+    done_events2 = [e for e in events2 if e.get("done")]
+    check(
+        "stream cache hit: exactly one delta event (whole cached answer, not chunked)",
+        len(deltas2) == 1,
+        str(events2),
+    )
+    check(
+        "stream cache hit: done event has cached=true",
+        len(done_events2) == 1 and done_events2[0].get("cached") is True,
+        str(done_events2),
+    )
+
+    # --- streaming: multi-turn follow-up still resolves via rewrite ---
+    events3, status3 = retry_on_transient_503_stream(
+        lambda: chat_stream(main_key, FOLLOWUP, stream_user, session_id=stream_session_id)
+    )
+    check("POST /chat stream=true multi-turn -> 200", status3 == 200, str(events3))
+    followup_answer = "".join(e["delta"] for e in events3 if "delta" in e).lower()
+    check(
+        "stream multi-turn follow-up resolves against history",
+        any(kw in followup_answer for kw in ("afternoon", "evening", "exercise", "due date")),
+        followup_answer,
+    )
+
+    # --- streaming: DB has the correct persisted messages ---
+    persisted = db.fetchall(
+        "SELECT role, content FROM chat_messages WHERE session_id = %s ORDER BY id",
+        (stream_session_id,),
+    )
+    check(
+        "streamed turn persisted correctly to chat_messages",
+        len(persisted) >= 2
+        and persisted[0]["role"] == "user"
+        and persisted[0]["content"] == REAL_QUESTION
+        and persisted[1]["role"] == "assistant"
+        and persisted[1]["content"] == full_streamed_answer,
+        str(persisted[:2]),
     )
 
     # --- cleanup ---
