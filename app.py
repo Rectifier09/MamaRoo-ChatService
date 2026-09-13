@@ -162,6 +162,30 @@ def list_sessions(
     return SessionListResponse(sessions=sessions)
 
 
+@app.get("/chat/sessions/{session_id}/messages", response_model=SessionMessagesResponse)
+def get_session_messages(
+    session_id: int,
+    end_user_id: str,
+    product: dict = Depends(get_product),
+):
+    owned = db.fetchone(
+        "SELECT id FROM chat_sessions WHERE id = %s AND product_id = %s AND end_user_id = %s",
+        (session_id, product["id"], end_user_id),
+    )
+    if not owned:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    rows = db.fetchall(
+        "SELECT role, content, created_at FROM chat_messages WHERE session_id = %s ORDER BY id",
+        (session_id,),
+    )
+    messages = [
+        MessageItem(role=r["role"], content=r["content"], created_at=r["created_at"])
+        for r in rows
+    ]
+    return SessionMessagesResponse(session_id=session_id, messages=messages)
+
+
 @app.post("/admin/products", response_model=CreateProductResponse)
 def create_product(req: CreateProductRequest, x_admin_key: str = Header(...)):
     if not config.ADMIN_API_KEY or x_admin_key != config.ADMIN_API_KEY:
