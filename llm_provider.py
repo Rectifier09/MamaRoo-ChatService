@@ -4,12 +4,16 @@ instead of importing anthropic (or openai, or anyone else) directly — swapping
 active provider is a config change (LLM_PROVIDER / REWRITE_PROVIDER / ANSWER_PROVIDER
 in config.py), not a code change.
 
-To add another provider (a local model server, etc.):
-    1. Write a class with a `complete(system, messages, model, max_tokens) -> str` method.
-    2. Add it to _PROVIDERS below.
+To add another provider:
+    1. If it speaks OpenAI's chat.completions API shape (most "OpenAI-compatible"
+       gateways do — Groq, Together, Fireworks, a self-hosted vLLM server, etc.),
+       subclass _OpenAICompatibleProvider and set two class attributes: `base_url`
+       and `api_key_config_name`. See GroqProvider below — that's the whole class.
+    2. Otherwise, write a class with its own `complete(system, messages, model,
+       max_tokens) -> str` method from scratch (see AnthropicProvider, GeminiProvider).
+    3. Either way, add the class to _PROVIDERS below and its API key to config.py.
 That's the whole integration surface — nothing in rewrite.py or rag_engine.py needs
-to know it exists. Gemini (`GeminiProvider`) was added this way; use it as the
-template for a fourth.
+to know it exists.
 """
 from dataclasses import dataclass
 from typing import Protocol
@@ -59,21 +63,35 @@ class AnthropicProvider:
         return "".join(block.text for block in response.content if block.type == "text")
 
 
-class OpenAIProvider:
+class _OpenAICompatibleProvider:
     """
-    Reference second implementation — proves the abstraction is real, not just
-    theoretical. OpenAI's platform caches repeated prompt prefixes automatically (no
-    explicit cache_control call needed), so the `cacheable` hint is unused here; the
-    static instructions block still goes first, in case that helps the automatic
-    matching, but there's no equivalent lever to pull on purpose the way there is with
-    Anthropic's explicit cache_control.
+    Shared base for any provider that speaks OpenAI's chat.completions API shape —
+    OpenAI itself, and any "OpenAI-compatible" gateway (Groq, Together, Fireworks,
+    a self-hosted vLLM server, ...) that implements the same endpoint shape against
+    a different `base_url`. A new one of these is a 4-line subclass (see
+    GroqProvider) — no new HTTP/request logic, since the `openai` SDK already
+    supports a custom `base_url`.
+
+    None of these platforms have an explicit prompt-caching call to make here (no
+    equivalent to Anthropic's `cache_control`), so the `cacheable` hint is unused —
+    the static instructions block still goes first in case that helps automatic
+    prefix-based caching where the platform does it, but there's no lever to pull
+    on purpose.
+
+    Subclasses set:
+        base_url            — None for OpenAI's own default, or the gateway's URL
+        api_key_config_name — the config.py attribute name holding the API key
     """
+    base_url: str | None = None
+    api_key_config_name: str = "OPENAI_API_KEY"
+
     def __init__(self):
         import openai
 
-        if not config.OPENAI_API_KEY:
-            raise RuntimeError("OPENAI_API_KEY is not set but the openai provider is selected")
-        self._client = openai.OpenAI(api_key=config.OPENAI_API_KEY)
+        api_key = getattr(config, self.api_key_config_name, "")
+        if not api_key:
+            raise RuntimeError(f"{self.api_key_config_name} is not set but this provider is selected")
+        self._client = openai.OpenAI(api_key=api_key, base_url=self.base_url)
 
     def complete(self, system, messages, model, max_tokens):
         system_text = "\n\n".join(block.text for block in system)
@@ -84,6 +102,25 @@ class OpenAIProvider:
             messages=full_messages,
         )
         return response.choices[0].message.content or ""
+
+
+class OpenAIProvider(_OpenAICompatibleProvider):
+    """Reference second implementation — proves the abstraction is real, not just
+    theoretical. Uses OpenAI's own default base_url."""
+    api_key_config_name = "OPENAI_API_KEY"
+
+
+class GroqProvider(_OpenAICompatibleProvider):
+    """
+    Groq-hosted open-weight models (e.g. openai/gpt-oss-120b) over its
+    OpenAI-compatible endpoint. Added for two reasons: Groq's inference is fast,
+    and — the reason it matters here — it's a completely independent quota pool
+    from Gemini, so splitting REWRITE_PROVIDER=groq / ANSWER_PROVIDER=gemini (or
+    either alone) means one provider's free-tier daily cap doesn't take down the
+    whole service. See ARCHITECTURE.md's "LLM provider abstraction" section.
+    """
+    base_url = "https://api.groq.com/openai/v1"
+    api_key_config_name = "GROQ_API_KEY"
 
 
 class GeminiProvider:
@@ -135,6 +172,7 @@ _PROVIDERS = {
     "anthropic": AnthropicProvider,
     "openai": OpenAIProvider,
     "gemini": GeminiProvider,
+    "groq": GroqProvider,
 }
 
 _instances: dict[str, LLMProvider] = {}
