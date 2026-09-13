@@ -168,29 +168,47 @@ def _stream_chat_response(req: ChatRequest, session_id: int, history: list[dict]
                 if "error" in payload:
                     yield f"data: {json.dumps({'done': True, 'error': payload['error']})}\n\n"
                     return
-                db.execute(
-                    "INSERT INTO chat_messages (session_id, role, content) VALUES (%s, 'user', %s)",
-                    (session_id, req.message),
-                )
-                db.execute(
-                    "INSERT INTO chat_messages (session_id, role, content) VALUES (%s, 'assistant', %s)",
-                    (session_id, full_answer),
-                )
-                yield (
-                    "data: "
-                    + json.dumps(
-                        {
-                            "done": True,
-                            "session_id": session_id,
-                            "sources": payload["sources"],
-                            "cached": payload["cached"],
-                        }
+                # The 200 text/event-stream status and real delta events are
+                # already committed by now, so a failure persisting the turn
+                # can't become an HTTP error -- it has to be the in-stream
+                # terminal error event instead. Without this, a DB blip here
+                # would end the stream with no terminal event at all and the
+                # client would hang until timeout.
+                try:
+                    db.execute(
+                        "INSERT INTO chat_messages (session_id, role, content) VALUES (%s, 'user', %s)",
+                        (session_id, req.message),
                     )
-                    + "\n\n"
-                )
+                    db.execute(
+                        "INSERT INTO chat_messages (session_id, role, content) VALUES (%s, 'assistant', %s)",
+                        (session_id, full_answer),
+                    )
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "done": True,
+                                "session_id": session_id,
+                                "sources": payload["sources"],
+                                "cached": payload["cached"],
+                            }
+                        )
+                        + "\n\n"
+                    )
+                except Exception as exc:
+                    yield f"data: {json.dumps({'done': True, 'error': str(exc)})}\n\n"
+                    return
 
     return StreamingResponse(
-        event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            # Tells nginx-family reverse proxies not to buffer the response --
+            # without it a proxy can hold every delta until the stream ends,
+            # silently turning this back into a non-streaming response.
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

@@ -80,6 +80,9 @@ def generate_answer_stream(message: str, history: list[dict] | None = None):
     """Yields ("delta", str) tuples as answer text becomes available, then
     exactly one ("done", dict): {"sources": [...], "cached": bool} on
     success, or {"error": str} if generation failed after streaming began.
+    Exactly one "done" is always yielded, including when the failure happens
+    after deltas were already sent (a provider error mid-stream, an empty
+    generation, or the cache write failing) -- the stream never just stops.
     Exceptions from rewrite/embed/cache-lookup/retrieve are NOT caught here
     -- they propagate out of the generator's first next() call so the caller
     can distinguish "failed before anything was sent" from "failed mid-
@@ -105,6 +108,11 @@ def generate_answer_stream(message: str, history: list[dict] | None = None):
     provider = get_provider(config.ANSWER_PROVIDER)
     sources = sorted({meta.get("source") for _, meta in chunks})
     full_answer = ""
+    # store_answer lives INSIDE this try on purpose: by the time it runs, real
+    # delta events have already reached the client, so a failure there (DB blip,
+    # pool timeout -- db.py's pool caps at max_size=5) must still produce a
+    # terminal event rather than an exception escaping the generator and leaving
+    # the stream dangling with nothing.
     try:
         for delta in provider.stream_complete(
             system=system,
@@ -114,9 +122,24 @@ def generate_answer_stream(message: str, history: list[dict] | None = None):
         ):
             full_answer += delta
             yield "delta", delta
+
+        if full_answer:
+            cache.store_answer(canonical, query_embedding, full_answer, sources)
     except Exception as exc:
         yield "done", {"error": str(exc)}
         return
 
-    cache.store_answer(canonical, query_embedding, full_answer, sources)
+    if not full_answer:
+        # The provider returned cleanly but emitted nothing -- reachable with
+        # reasoning models (Groq's openai/gpt-oss-120b) whose reasoning can
+        # consume the whole MAX_TOKENS budget before any visible text, the same
+        # failure class as Gemini's thinking_budget issue handled in
+        # llm_provider.py. Caching "" (above) would poison qa_cache, which is
+        # shared with the non-streaming path (see ARCHITECTURE.md): later
+        # semantically-similar questions -- including plain non-streaming ones
+        # -- would come back 200 with an empty answer. So: write nothing, and
+        # report it as the failure it is.
+        yield "done", {"error": "empty response from provider"}
+        return
+
     yield "done", {"sources": sources, "cached": False}
