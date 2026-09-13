@@ -2,12 +2,14 @@
 Run with:
     uvicorn app:app --reload --port 8000
 """
+import json
 import secrets
 from datetime import datetime
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import config
@@ -34,6 +36,7 @@ class ChatRequest(BaseModel):
     end_user_id: str          # a stable id for this end user — real user id, or a
                                # client-generated UUID stored in localStorage
     session_id: Optional[int] = None  # omit to start a new conversation
+    stream: bool = False      # true -> text/event-stream instead of one JSON body
 
 
 class ChatResponse(BaseModel):
@@ -108,6 +111,9 @@ def chat(req: ChatRequest, product: dict = Depends(get_product)):
     )
     history = [{"role": r["role"], "content": r["content"]} for r in reversed(history_rows)]
 
+    if req.stream:
+        return _stream_chat_response(req, session_id, history)
+
     try:
         answer, sources, cached = rag_engine.generate_answer(req.message, history=history)
     except Exception as exc:
@@ -123,6 +129,69 @@ def chat(req: ChatRequest, product: dict = Depends(get_product)):
     )
 
     return ChatResponse(answer=answer, sources=sources, session_id=session_id, cached=cached)
+
+
+def _stream_chat_response(req: ChatRequest, session_id: int, history: list[dict]) -> StreamingResponse:
+    try:
+        supports_streaming = rag_engine.answer_provider_supports_streaming()
+    except Exception as exc:
+        # Provider instantiation itself can fail (e.g. missing API key) before
+        # we ever get to check for stream_complete -- still a clean JSON 500,
+        # not an unhandled exception surfacing as a raw 500 page.
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if not supports_streaming:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Provider '{config.ANSWER_PROVIDER}' does not support streaming",
+        )
+
+    gen = rag_engine.generate_answer_stream(req.message, history=history)
+    try:
+        first_kind, first_payload = next(gen)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if first_kind == "done":
+        # The LLM failed on its very first chunk -- nothing was ever sent to
+        # the client yet, so this is still a normal JSON error, not a stream.
+        raise HTTPException(status_code=500, detail=first_payload.get("error", "generation failed"))
+
+    def event_stream():
+        full_answer = first_payload
+        yield f"data: {json.dumps({'delta': first_payload})}\n\n"
+        for kind, payload in gen:
+            if kind == "delta":
+                full_answer += payload
+                yield f"data: {json.dumps({'delta': payload})}\n\n"
+            else:  # kind == "done"
+                if "error" in payload:
+                    yield f"data: {json.dumps({'done': True, 'error': payload['error']})}\n\n"
+                    return
+                db.execute(
+                    "INSERT INTO chat_messages (session_id, role, content) VALUES (%s, 'user', %s)",
+                    (session_id, req.message),
+                )
+                db.execute(
+                    "INSERT INTO chat_messages (session_id, role, content) VALUES (%s, 'assistant', %s)",
+                    (session_id, full_answer),
+                )
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "done": True,
+                            "session_id": session_id,
+                            "sources": payload["sources"],
+                            "cached": payload["cached"],
+                        }
+                    )
+                    + "\n\n"
+                )
+
+    return StreamingResponse(
+        event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"}
+    )
 
 
 @app.get("/chat/sessions", response_model=SessionListResponse)
