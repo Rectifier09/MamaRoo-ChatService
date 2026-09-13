@@ -8,12 +8,17 @@ import config
 
 
 def find_cached_answer(question_embedding) -> dict | None:
+    # ::vector casts are required here: psycopg has no destination-column type to
+    # infer from in a bare `<=>` expression, so a plain Python list parameter
+    # defaults to `double precision[]` and Postgres rejects `vector <=> double
+    # precision[]` outright. INSERTs don't need this (the target column's type
+    # supplies it), only comparisons like this one.
     row = db.fetchone(
         """
         SELECT id, answer, sources, canonical_question,
-               (question_embedding <=> %s) AS distance
+               (question_embedding <=> %s::vector) AS distance
         FROM qa_cache
-        ORDER BY question_embedding <=> %s
+        ORDER BY question_embedding <=> %s::vector
         LIMIT 1
         """,
         (question_embedding, question_embedding),

@@ -25,8 +25,10 @@ guess or use outside knowledge.
 
 def retrieve(query_embedding, k: int = None) -> list[tuple[str, dict]]:
     k = k or config.TOP_K
+    # ::vector cast required — see the matching comment in cache.py's
+    # find_cached_answer for why a bare `<=>` comparison needs it.
     rows = db.fetchall(
-        "SELECT source, content FROM kb_chunks ORDER BY embedding <=> %s LIMIT %s",
+        "SELECT source, content FROM kb_chunks ORDER BY embedding <=> %s::vector LIMIT %s",
         (query_embedding, k),
     )
     return [(r["content"], {"source": r["source"]}) for r in rows]
