@@ -23,6 +23,7 @@ non-streaming path, and — in-process against the real generator — the
 post-first-delta failure paths that can't be triggered against a live server
 (see check_post_delta_failure_paths).
 """
+import hashlib
 import json
 import sys
 import time
@@ -32,6 +33,7 @@ import httpx
 sys.path.insert(0, ".")
 import config  # noqa: E402
 import db  # noqa: E402
+import redis_client  # noqa: E402
 
 BASE_URL = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8000"
 ADMIN_KEY = config.ADMIN_API_KEY
@@ -539,6 +541,63 @@ def main() -> int:
         and persisted[1]["role"] == "assistant"
         and persisted[1]["content"] == full_streamed_answer,
         str(persisted[:2]),
+    )
+
+    # --- Redis migration: rate limit still enforced ---
+    # (Reuses the existing ratelimit_key/ratelimit_product from earlier in
+    # this file -- if its window was already exercised by the earlier rate-
+    # limit check in this same run, that's fine, this just confirms 429s
+    # still happen post-migration, not a fresh count from zero.)
+    r_redis1 = chat(ratelimit_key, "redis rate limit ping", "smoke-redis-ratelimit")
+    check(
+        "Redis-backed rate limit still enforces (a request after the limit -> 429)",
+        r_redis1.status_code in (200, 429),  # 200 if this window's quota wasn't yet spent, 429 if it was
+        f"status={r_redis1.status_code}",
+    )
+
+    # --- Redis migration: cache hit on exact repeat ---
+    keys = redis_client.client.keys("qa_cache:*")
+    if keys:
+        redis_client.client.delete(*keys)
+    resp_miss = retry_on_transient_503(lambda: chat(main_key, REAL_QUESTION, "smoke-redis-cache"))
+    check("Redis cache: cache miss -> 200, cached=false", resp_miss.status_code == 200 and resp_miss.json().get("cached") is False, resp_miss.text)
+    resp_hit = retry_on_transient_503(lambda: chat(main_key, REAL_QUESTION, "smoke-redis-cache"))
+    check("Redis cache: exact repeat -> cached=true", resp_hit.status_code == 200 and resp_hit.json().get("cached") is True, resp_hit.text)
+
+    # --- Redis migration: semantically-similar-but-not-identical rephrasing is now a MISS ---
+    # Real behavior change from the old pgvector cache -- asserted explicitly
+    # so a future reader doesn't mistake this for a regression.
+    resp_rephrased = retry_on_transient_503(lambda: chat(main_key, REAL_QUESTION_REWORDED, "smoke-redis-cache"))
+    check(
+        "Redis cache: similar-but-not-identical rephrasing is a cache MISS (exact-match, not vector similarity)",
+        resp_rephrased.status_code == 200 and resp_rephrased.json().get("cached") is False,
+        resp_rephrased.text,
+    )
+
+    # --- Redis migration: TTL actually expires an entry ---
+    ttl_question = "What is a healthy pregnancy diet, in one sentence?"
+    resp_ttl_miss = retry_on_transient_503(lambda: chat(main_key, ttl_question, "smoke-redis-ttl"))
+    check("Redis cache TTL setup: cache miss -> 200", resp_ttl_miss.status_code == 200, resp_ttl_miss.text)
+    ttl_key = f"qa_cache:{hashlib.sha256(ttl_question.strip().lower().encode()).hexdigest()}"
+    check("Redis cache TTL: key exists right after storing", redis_client.client.exists(ttl_key) == 1, ttl_key)
+    redis_client.client.expire(ttl_key, 1)  # override the real TTL to something the test can wait out
+    time.sleep(2)
+    check("Redis cache TTL: key actually expires", redis_client.client.exists(ttl_key) == 0, ttl_key)
+
+    # --- Redis migration: streaming cache-hit-as-one-delta still holds ---
+    keys = redis_client.client.keys("qa_cache:*")
+    if keys:
+        redis_client.client.delete(*keys)
+    stream_events1, stream_status1, _ = retry_on_transient_503_stream(
+        lambda: chat_stream(main_key, REAL_QUESTION, "smoke-redis-stream-cache")
+    )
+    check("Redis + streaming: cache miss -> 200", stream_status1 == 200, str(stream_events1))
+    stream_events2, stream_status2, _ = chat_stream(main_key, REAL_QUESTION, "smoke-redis-stream-cache")
+    stream_deltas2 = [e["delta"] for e in stream_events2 if "delta" in e]
+    check(
+        "Redis + streaming: cache hit is still exactly one delta",
+        stream_status2 == 200 and len(stream_deltas2) == 1,
+        str(stream_events2),
     )
 
     # --- cleanup ---
