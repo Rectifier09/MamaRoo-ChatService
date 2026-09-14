@@ -44,12 +44,12 @@ def _build_context(chunks: list[tuple[str, dict]]) -> str:
 def generate_answer(message: str, history: list[dict] | None = None) -> tuple[str, list[str], bool]:
     """Returns (answer, sources, was_cache_hit)."""
     canonical = rewrite_query(message, history)
-    query_embedding = embed_texts([canonical])[0]
 
-    cached = cache.find_cached_answer(query_embedding)
+    cached = cache.find_cached_answer(canonical)
     if cached:
         return cached["answer"], list(cached["sources"]), True
 
+    query_embedding = embed_texts([canonical])[0]
     chunks = retrieve(query_embedding)
     system = [
         SystemBlock(text=SYSTEM_INSTRUCTIONS, cacheable=True),
@@ -68,7 +68,7 @@ def generate_answer(message: str, history: list[dict] | None = None) -> tuple[st
     )
     sources = sorted({meta.get("source") for _, meta in chunks})
 
-    cache.store_answer(canonical, query_embedding, answer, sources)
+    cache.store_answer(canonical, answer, sources)
     return answer, sources, False
 
 
@@ -88,14 +88,14 @@ def generate_answer_stream(message: str, history: list[dict] | None = None):
     can distinguish "failed before anything was sent" from "failed mid-
     stream" (see app.py)."""
     canonical = rewrite_query(message, history)
-    query_embedding = embed_texts([canonical])[0]
 
-    cached = cache.find_cached_answer(query_embedding)
+    cached = cache.find_cached_answer(canonical)
     if cached:
         yield "delta", cached["answer"]
         yield "done", {"sources": list(cached["sources"]), "cached": True}
         return
 
+    query_embedding = embed_texts([canonical])[0]
     chunks = retrieve(query_embedding)
     system = [
         SystemBlock(text=SYSTEM_INSTRUCTIONS, cacheable=True),
@@ -124,7 +124,7 @@ def generate_answer_stream(message: str, history: list[dict] | None = None):
             yield "delta", delta
 
         if full_answer:
-            cache.store_answer(canonical, query_embedding, full_answer, sources)
+            cache.store_answer(canonical, full_answer, sources)
     except Exception as exc:
         yield "done", {"error": str(exc)}
         return
