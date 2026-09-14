@@ -10,3 +10,4 @@ sentence-transformers
 pypdf
 python-dotenv
 pydantic
+redis

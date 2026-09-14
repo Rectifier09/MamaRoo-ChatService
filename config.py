@@ -60,3 +60,7 @@ ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 
 # --- Rate limiting (in-memory — see README for the multi-instance caveat) ---
 DEFAULT_RATE_LIMIT_PER_MINUTE = int(os.environ.get("DEFAULT_RATE_LIMIT_PER_MINUTE", 30))
+
+# --- Redis (rate limiting + semantic cache — see redis_client.py) ---
+REDIS_URL = os.environ.get("REDIS_URL", "")
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", 86400))  # 24h
