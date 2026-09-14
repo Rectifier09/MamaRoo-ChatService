@@ -183,7 +183,8 @@ def check_post_delta_failure_paths() -> None:
     import rag_engine
 
     def cache_rows() -> int:
-        return db.fetchone("SELECT count(*) AS n FROM qa_cache")["n"]
+        # Redis migration: measure real cache (Redis), not abandoned Postgres table
+        return len(redis_client.client.keys("qa_cache:*") or [])
 
     provider = llm_provider.get_provider(config.ANSWER_PROVIDER)
 
@@ -314,6 +315,10 @@ def main() -> int:
     check("POST /chat allowed origin -> 200", resp.status_code == 200, resp.text)
 
     # --- cache miss / cache hit ---
+    # Redis migration: clear persistent cache to ensure this test is repeatable across runs
+    keys = redis_client.client.keys("qa_cache:*")
+    if keys:
+        redis_client.client.delete(*keys)
     resp = retry_on_transient_503(lambda: chat(main_key, REAL_QUESTION, "smoke-cache"))
     check("cache miss -> 200, cached=false", resp.status_code == 200 and resp.json().get("cached") is False, resp.text)
     body = resp.json()
@@ -321,7 +326,8 @@ def main() -> int:
     session_id = body.get("session_id")
 
     resp = retry_on_transient_503(lambda: chat(main_key, REAL_QUESTION_REWORDED, "smoke-cache"))
-    check("cache hit (reworded question) -> cached=true", resp.status_code == 200 and resp.json().get("cached") is True, resp.text)
+    # Redis migration: rephrasing is now a MISS (exact-match, not vector similarity) — see ARCHITECTURE.md
+    check("cache miss (reworded question) -> cached=false", resp.status_code == 200 and resp.json().get("cached") is False, resp.text)
 
     # --- multi-turn / rewrite ---
     resp = chat(main_key, FOLLOWUP, "smoke-cache", session_id=session_id)
@@ -462,7 +468,11 @@ def main() -> int:
     )
 
     # Clear qa_cache before testing streaming behavior, so cache miss test is unambiguous
+    # Redis migration: clear both Postgres (for in-process tests) and Redis (real cache backend)
     db.execute("DELETE FROM qa_cache")
+    keys = redis_client.client.keys("qa_cache:*")
+    if keys:
+        redis_client.client.delete(*keys)
 
     # --- streaming: post-first-delta failure paths (in-process, see docstring) ---
     check_post_delta_failure_paths()
@@ -607,6 +617,10 @@ def main() -> int:
     )
     db.execute("DELETE FROM chat_sessions WHERE end_user_id = ANY(%s)", (_created_end_users,))
     db.execute("DELETE FROM qa_cache")
+    # Redis migration: also clear Redis cache for consistency
+    keys = redis_client.client.keys("qa_cache:*")
+    if keys:
+        redis_client.client.delete(*keys)
     db.execute("DELETE FROM products WHERE id = ANY(%s)", (_created_product_ids,))
     print(f"\nCleaned up {len(_created_product_ids)} test product(s) and their sessions/cache.")
 
