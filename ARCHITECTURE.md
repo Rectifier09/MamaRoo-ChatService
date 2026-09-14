@@ -13,20 +13,22 @@ Browser (product A, B, or C's frontend)
 auth.get_product        → looks up the key in `products`; if the product has a
                            non-wildcard allowed_origins list, checks the request's
                            Origin/Referer header against it
-rate_limit.check         → in-memory sliding window, keyed by API key
+rate_limit.check         → Redis fixed-window counter (INCR/EXPIRE), keyed by API key
 (app.py)                 → looks up or creates a chat_sessions row for
                            (product_id, end_user_id); loads recent chat_messages
                            for this session as `history`
 rewrite.rewrite_query    → Haiku rewrites the latest message into a standalone
                            question, using `history` only to resolve references
-embeddings.embed_texts   → embeds the standalone question (local model, no API call)
-cache.find_cached_answer → pgvector similarity search against qa_cache
-   ├─ hit (distance ≤ CACHE_MAX_DISTANCE)
-   │      → return the cached answer. No LLM call at all.
+cache.find_cached_answer → exact-match lookup in Redis, keyed by a hash of the
+                           canonical question (see "Redis-backed rate limiter
+                           and cache" below)
+   ├─ hit
+   │      → return the cached answer. No LLM call, no embedding call either.
    └─ miss
+          → embeddings.embed_texts: embeds the standalone question (local model, no API call)
           → rag_engine.retrieve: pgvector search over kb_chunks (TOP_K nearest)
           → Claude (ANSWER_MODEL) answers using only the retrieved excerpts
-          → cache.store_answer saves the new Q/A pair
+          → cache.store_answer saves the new Q/A pair (Redis, with a TTL)
 (app.py)                 → logs both turns to chat_messages
                           → returns {answer, sources, session_id, cached}
 ```
@@ -185,13 +187,47 @@ updated deploy is how the knowledge base gets refreshed — no rebuild/redeploy 
 image is required for that step, since the KB lives in Postgres, not baked into the
 image.
 
+## Redis-backed rate limiter and cache (Phase 2)
+
+`rate_limit.py` and `cache.py` moved off in-process state / Postgres onto
+Redis (`redis_client.py`). Two independent fixes:
+
+- **Rate limiter**: was an in-process Python dict, correct only with exactly
+  one app replica (each replica counted independently, silently multiplying
+  the effective limit by replica count). Now a Redis `INCR`/`EXPIRE`
+  fixed-window counter, shared and atomic across every replica.
+  `rate_limit.check(key, limit)`'s signature and behavior from the caller's
+  perspective (raises `429` past the limit) are unchanged.
+- **Semantic cache**: was Postgres `qa_cache`, searched by pgvector cosine
+  similarity, truncated entirely on every `ingest.py` run (a correctness
+  necessity, not a choice — see below). Now Redis, keyed by an exact-match
+  SHA-256 hash of the canonical (rewritten) question, with a real per-entry
+  TTL (`CACHE_TTL_SECONDS`, default 24h) instead of an all-or-nothing flush.
+  `ingest.py` no longer touches the cache at all — old entries simply age
+  out on their own schedule now, independent of when the knowledge base was
+  last updated.
+
+**Why exact-match, not vector similarity in Redis**: Railway's own
+first-party Redis template runs the plain official Redis image, not Redis
+Stack — RediSearch (needed for vector search in Redis) isn't available
+without deploying a separate custom image, the same manual-deploy pattern
+`kb_chunks`' own Postgres/pgvector service required. Not worth that extra
+infrastructure for the cache specifically, especially since the semantic
+net given up is narrower than "vector similarity" sounds: this project's
+own `CACHE_MAX_DISTANCE` threshold (0.08) already rejected some genuine
+rephrasings of the same real question as too dissimilar to match — see the
+Decisions log for the specific measured example. Full rationale:
+`docs/superpowers/specs/2026-09-13-redis-phase2-migration-design.md`.
+
+**Postgres `qa_cache` is kept, unused, as a fallback** — not dropped by this
+migration. Drop it (`DROP TABLE IF EXISTS qa_cache;`) only once Redis-backed
+caching has run correctly in production for a while.
+
 ## Known limitations carried into Phase 1 on purpose
 
 These are documented trade-offs, not bugs to silently fix — if any of them become a
 real problem, that's a conversation to have explicitly, not a unilateral change:
 
-- **Rate limiter is single-instance** (`rate_limit.py` uses an in-process dict). Correct
-  only with exactly one app replica. Phase 2 fixes this.
 - **No re-ranking or hybrid search** — pure vector similarity. Exact terms, IDs, and
   acronyms retrieve worse than conceptual questions.
 - **No OCR** — scanned/image-only PDFs silently yield no usable text (`ingest.py`
