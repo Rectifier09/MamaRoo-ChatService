@@ -1,5 +1,10 @@
 # Phase 2 — Adding Redis
 
+**Superseded:** this migration is complete — see `ARCHITECTURE.md`'s
+"Redis-backed rate limiter and cache (Phase 2)" section for what was actually built.
+The rest of this file is kept as the original planning doc and no longer reflects
+current status.
+
 **Don't start this until Phase 1's definition of done (in `BUILD_PLAN.md`) is met and
 verified in production on Railway.** This phase is additive — nothing from Phase 1
 gets torn out or redesigned, two things just move where they live.

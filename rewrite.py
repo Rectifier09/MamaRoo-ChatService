@@ -1,7 +1,15 @@
 """
 Rewrites the user's latest message into a standalone question before it's embedded —
-both for retrieval accuracy and so that differently-phrased-but-equivalent questions
-land close together in the semantic cache.
+both for retrieval accuracy and to normalize phrasing so a user's literal repeat, or
+this same rewrite call's own deterministic-when-lucky repeat, can exact-match in the
+cache (cache.py does exact-match on this rewritten text, not vector similarity — see
+ARCHITECTURE.md's "Redis-backed rate limiter and cache" section). That exact-match
+depends on this call producing byte-identical output for the same effective question,
+which isn't guaranteed: no provider call in this codebase sets a `temperature`
+parameter (llm_provider.py's `LLMProvider` Protocol doesn't have one), so a multi-turn
+follow-up's cache hit rate is at the mercy of whatever determinism the provider
+happens to give at its default temperature. First-turn messages (no history) skip
+this call entirely via the short-circuit below, so they're unaffected.
 
 Deliberately uses the cheap REWRITE_MODEL/REWRITE_PROVIDER: this call has a short
 prompt and a short answer, so it stays negligible next to the cost of the actual

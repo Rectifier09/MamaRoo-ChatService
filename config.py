@@ -58,7 +58,7 @@ MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", 6))  # user+assistan
 # Used to protect the /admin/products endpoint that issues new product API keys.
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "")
 
-# --- Rate limiting (in-memory — see README for the multi-instance caveat) ---
+# --- Rate limiting (Redis-backed fixed-window counter — see rate_limit.py) ---
 DEFAULT_RATE_LIMIT_PER_MINUTE = int(os.environ.get("DEFAULT_RATE_LIMIT_PER_MINUTE", 30))
 
 # --- Redis (rate limiting + semantic cache — see redis_client.py) ---

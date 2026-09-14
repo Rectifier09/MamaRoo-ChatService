@@ -1,6 +1,6 @@
 """
 Core retrieval-augmented generation logic:
-    rewrite -> embed -> check semantic cache -> (on miss) retrieve + generate -> cache the result
+    rewrite -> check semantic cache -> (on miss) embed -> retrieve + generate -> cache the result
 """
 import cache
 import config
@@ -25,8 +25,10 @@ guess or use outside knowledge.
 
 def retrieve(query_embedding, k: int = None) -> list[tuple[str, dict]]:
     k = k or config.TOP_K
-    # ::vector cast required — see the matching comment in cache.py's
-    # find_cached_answer for why a bare `<=>` comparison needs it.
+    # ::vector cast required: psycopg has no destination-column type to infer
+    # from in a bare comparison expression, so a plain Python list parameter
+    # defaults to `double precision[]`, and Postgres rejects
+    # `vector <=> double precision[]` outright without an explicit cast.
     rows = db.fetchall(
         "SELECT source, content FROM kb_chunks ORDER BY embedding <=> %s::vector LIMIT %s",
         (query_embedding, k),
@@ -134,8 +136,9 @@ def generate_answer_stream(message: str, history: list[dict] | None = None):
         # reasoning models (Groq's openai/gpt-oss-120b) whose reasoning can
         # consume the whole MAX_TOKENS budget before any visible text, the same
         # failure class as Gemini's thinking_budget issue handled in
-        # llm_provider.py. Caching "" (above) would poison qa_cache, which is
-        # shared with the non-streaming path (see ARCHITECTURE.md): later
+        # llm_provider.py. Caching "" (above) would poison the Redis-backed
+        # cache, which is shared with the non-streaming path (see
+        # ARCHITECTURE.md): later
         # semantically-similar questions -- including plain non-streaming ones
         # -- would come back 200 with an empty answer. So: write nothing, and
         # report it as the failure it is.

@@ -145,6 +145,19 @@ def chat_stream(
     return events, status_code, ""
 
 
+def ensure_fresh_rate_limit_window(min_headroom: float = 45.0) -> None:
+    """rate_limit.py's Redis limiter buckets by calendar minute (int(time.time()
+    // 60)). The rate-limit burst below sends several sequential real /chat
+    requests -- each takes real wall-clock time -- and needs the whole burst to
+    land inside one window, or the counter resets mid-burst and the expected
+    429 doesn't happen. Rather than hope the burst is fast enough to not cross
+    a minute boundary, wait for the start of a fresh minute first so the burst
+    has close to the full 60s to work with."""
+    remaining = 60 - (time.time() % 60)
+    if remaining < min_headroom:
+        time.sleep(remaining + 0.5)
+
+
 def retry_on_transient_503_stream(fn, attempts: int = 3, delay: float = 8.0):
     """Same retry logic (and same semantics: retry only on 500 + UNAVAILABLE)
     as retry_on_transient_503, adapted for chat_stream's (events, status_code,
@@ -345,6 +358,10 @@ def main() -> int:
     )
 
     # --- rate limiting ---
+    # Pin to a fresh minute window first -- see ensure_fresh_rate_limit_window's
+    # docstring for why this burst would otherwise be flaky across a minute
+    # boundary with the new Redis fixed-window limiter.
+    ensure_fresh_rate_limit_window()
     r1 = chat(ratelimit_key, "ping one", "smoke-ratelimit")
     r2 = chat(ratelimit_key, "ping two", "smoke-ratelimit")
     r3 = chat(ratelimit_key, "ping three", "smoke-ratelimit")
@@ -359,8 +376,10 @@ def main() -> int:
     # about pre-stream error behavior -- same status codes, same JSON body
     # shape, never a stream. Checked here (rather than down in the streaming
     # section) so the 429 case can reuse ratelimit_key's already-exhausted
-    # window: a request that gets 429'd is rejected before the limiter records
-    # it, so this adds nothing to that key's counters.
+    # window: rate_limit.py's Redis limiter does INCR before checking the
+    # result, so a 429'd request DOES still increment the counter -- but since
+    # this key is already over its limit, one more counted request changes
+    # nothing about the 429 outcome being checked here.
     _, empty_status, _ = chat_stream(main_key, "   ", "smoke-stream-empty-msg")
     check("POST /chat stream=true empty message -> 400 (same as non-streaming)", empty_status == 400)
 

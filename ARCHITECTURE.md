@@ -151,12 +151,26 @@ Chunks don't carry a stable, deterministic ID tied to file path + chunk index in
 version — a full rebuild sidesteps needing one, at the cost of `ingest.py` being
 non-incremental (every run re-embeds the entire knowledge base, even unchanged files).
 Given the knowledge base here is small and updates are infrequent, that trade-off is
-intentional. `qa_cache` is truncated alongside `kb_chunks` for a correctness reason,
-not a performance one: any content change can invalidate any previously cached
-answer, and there's no cheap way to know which cached answers are affected by a given
-content change without a lot more bookkeeping. If ingestion frequency or KB size grows
-enough that a full rebuild becomes slow, revisit this — but that's a distinct problem
-from the Phase 2 migration and shouldn't be bundled into it.
+intentional. If ingestion frequency or KB size grows enough that a full rebuild
+becomes slow, revisit this.
+
+**`ingest.py` no longer touches the cache.** Before the Phase 2 Redis migration (see
+"Redis-backed rate limiter and cache" below), `qa_cache` was truncated alongside
+`kb_chunks` on every run for a correctness reason, not a performance one: any content
+change could invalidate any previously cached answer, and there was no cheap way to
+know which cached answers were affected by a given content change without a lot more
+bookkeeping. That guarantee no longer holds: **a KB re-ingest does NOT invalidate
+previously-cached answers.** A cached answer can now go on serving for up to
+`CACHE_TTL_SECONDS` (24h default) after the knowledge base content it was based on
+has changed, with no automatic flush — old entries simply age out on their own
+schedule, independent of when the KB was last updated.
+
+If a re-ingest changes something where serving a stale cached answer for up to
+`CACHE_TTL_SECONDS` would matter, flush the cache manually afterward:
+
+```bash
+redis-cli -u $REDIS_URL --scan --pattern 'qa_cache:*' | xargs -r redis-cli -u $REDIS_URL del
+```
 
 ## Deploying to Railway (Phase 1)
 
@@ -196,8 +210,11 @@ Redis (`redis_client.py`). Two independent fixes:
   one app replica (each replica counted independently, silently multiplying
   the effective limit by replica count). Now a Redis `INCR`/`EXPIRE`
   fixed-window counter, shared and atomic across every replica.
-  `rate_limit.check(key, limit)`'s signature and behavior from the caller's
-  perspective (raises `429` past the limit) are unchanged.
+  `rate_limit.check(key, limit)`'s signature and normal-path behavior from
+  the caller's perspective (raises `429` past the limit) are unchanged.
+  One new behavior: a Redis connection/timeout error makes it fail OPEN
+  (logs a warning, allows the request through) rather than raising an
+  uncaught error into `/chat` — see "Redis as a dependency" below.
 - **Semantic cache**: was Postgres `qa_cache`, searched by pgvector cosine
   similarity, truncated entirely on every `ingest.py` run (a correctness
   necessity, not a choice — see below). Now Redis, keyed by an exact-match
@@ -222,6 +239,35 @@ Decisions log for the specific measured example. Full rationale:
 **Postgres `qa_cache` is kept, unused, as a fallback** — not dropped by this
 migration. Drop it (`DROP TABLE IF EXISTS qa_cache;`) only once Redis-backed
 caching has run correctly in production for a while.
+
+**Redis as a dependency**: `/chat` now depends on Redis for both the rate
+limiter and the cache. `rate_limit.check()` and `cache.find_cached_answer()`/
+`cache.store_answer()` all fail OPEN on a Redis error (`redis.RedisError`) —
+a warning is logged, and the request proceeds as if the rate limiter allowed
+it / the cache missed, rather than the endpoint 500ing. This trades a small
+amount of correctness (uncapped rate limiting, no caching) for availability
+during a Redis outage, consistent with this limiter's existing posture of
+capping worst-case cost exposure rather than being a precise, security-
+critical throttle (see the "Rate limiter" trade-off above). `/health` stays
+dependency-free by design and does not check Redis, so a Redis outage does
+not turn it unhealthy — that's a deliberate choice given the endpoints above
+now degrade gracefully instead of failing.
+
+**Limitation: multi-turn cache hit rate depends on rewrite determinism.**
+The cache key is a hash of the canonical (rewritten) question, and for any
+multi-turn follow-up that canonical text comes from an LLM call
+(`rewrite.py`). No provider call in this codebase sets a `temperature`
+parameter — `llm_provider.py`'s `LLMProvider` Protocol and its three
+implementations (`AnthropicProvider`, `OpenAIProvider`/`GroqProvider`,
+`GeminiProvider`) have no such parameter — so the rewrite call isn't
+guaranteed to produce byte-identical output for the same effective
+question across turns, and an exact-match cache is sensitive to exactly
+that. First-turn (no-history) messages skip the rewrite call entirely via
+`rewrite.py`'s `if not history: return message.strip()` short-circuit, so
+they're unaffected — this only softens the hit rate for follow-up turns.
+Adding deterministic rewriting (threading a `temperature` parameter through
+the `LLMProvider` Protocol and all three implementations) is a real, scoped
+follow-up; it wasn't attempted as part of this migration.
 
 ## Known limitations carried into Phase 1 on purpose
 
