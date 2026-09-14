@@ -1,25 +1,30 @@
 """
-Simple in-process sliding-window rate limiter, keyed by API key.
+Redis-backed fixed-window rate limiter, keyed by API key.
 
-This is intentionally not backed by Redis/Postgres to keep infra minimal — it only
-enforces the limit correctly if the service runs as a single instance. If you scale
-this to multiple Railway replicas, each replica gets its own independent counter
-(so the effective limit becomes limit x replica_count) — move the counter into
-Postgres or add Redis at that point.
+Uses INCR + EXPIRE on a key bucketed by the current calendar minute, so the
+limit is enforced correctly no matter how many Railway replicas are running
+-- each replica hits the same shared Redis counter instead of its own
+in-process one (the bug this file's previous version had).
+
+Accepted trade-off: this is a fixed window, not an exact sliding window, so
+a client can in principle spend the full limit in the last second of one
+window and again in the first second of the next (~2x burst right at a
+minute boundary). Acceptable here because this limiter exists to cap
+worst-case cost exposure from a leaked/scraped key (see ARCHITECTURE.md's
+"Auth model" section), not to be a precise throttle -- Redis's atomic
+INCR/EXPIRE across replicas is what actually matters, not the window shape.
 """
 import time
-from collections import defaultdict, deque
 
 from fastapi import HTTPException
 
-_hits: dict[str, deque] = defaultdict(deque)
+import redis_client
 
 
 def check(key: str, limit_per_minute: int) -> None:
-    now = time.time()
-    window = _hits[key]
-    while window and window[0] < now - 60:
-        window.popleft()
-    if len(window) >= limit_per_minute:
+    window_key = f"ratelimit:{key}:{int(time.time() // 60)}"
+    count = redis_client.client.incr(window_key)
+    if count == 1:
+        redis_client.client.expire(window_key, 60)
+    if count > limit_per_minute:
         raise HTTPException(status_code=429, detail="Rate limit exceeded, try again shortly")
-    window.append(now)
