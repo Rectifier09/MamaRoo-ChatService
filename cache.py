@@ -1,39 +1,40 @@
 """
-Semantic cache over qa_cache. A hit skips the answer-generation LLM call entirely —
-the biggest single cost lever in this service, since it's a 100% savings rather than
-the ~90% Anthropic's own prompt caching gives on a cache hit.
+Redis-backed semantic cache, exact-match on the canonical (rewritten)
+question. A hit skips the answer-generation LLM call entirely -- the biggest
+single cost lever in this service, since it's a 100% savings rather than the
+~90% Anthropic's own prompt caching gives on a cache hit.
+
+Exact-match, not vector similarity: Railway's own Redis template runs plain
+Redis, not Redis Stack, so RediSearch vector search isn't available without
+deploying a separate custom image -- not worth the extra infrastructure for
+this. See docs/superpowers/specs/2026-09-13-redis-phase2-migration-design.md
+for the full rationale, including why the semantic net this gives up is
+narrower than it sounds (two genuine rephrasings of the same real question
+measured well outside the old pgvector cache's own similarity threshold).
 """
-import db
+import hashlib
+import json
+
 import config
+import redis_client
 
 
-def find_cached_answer(question_embedding) -> dict | None:
-    # ::vector casts are required here: psycopg has no destination-column type to
-    # infer from in a bare `<=>` expression, so a plain Python list parameter
-    # defaults to `double precision[]` and Postgres rejects `vector <=> double
-    # precision[]` outright. INSERTs don't need this (the target column's type
-    # supplies it), only comparisons like this one.
-    row = db.fetchone(
-        """
-        SELECT id, answer, sources, canonical_question,
-               (question_embedding <=> %s::vector) AS distance
-        FROM qa_cache
-        ORDER BY question_embedding <=> %s::vector
-        LIMIT 1
-        """,
-        (question_embedding, question_embedding),
-    )
-    if row and row["distance"] <= config.CACHE_MAX_DISTANCE:
-        db.execute("UPDATE qa_cache SET hit_count = hit_count + 1 WHERE id = %s", (row["id"],))
-        return row
-    return None
+def _cache_key(canonical_question: str) -> str:
+    digest = hashlib.sha256(canonical_question.strip().lower().encode()).hexdigest()
+    return f"qa_cache:{digest}"
 
 
-def store_answer(canonical_question: str, question_embedding, answer: str, sources: list[str]) -> None:
-    db.execute(
-        """
-        INSERT INTO qa_cache (canonical_question, question_embedding, answer, sources)
-        VALUES (%s, %s, %s, %s)
-        """,
-        (canonical_question, question_embedding, answer, sources),
+def find_cached_answer(canonical_question: str) -> dict | None:
+    raw = redis_client.client.get(_cache_key(canonical_question))
+    if raw is None:
+        return None
+    data = json.loads(raw)
+    return {"answer": data["answer"], "sources": data["sources"]}
+
+
+def store_answer(canonical_question: str, answer: str, sources: list[str]) -> None:
+    redis_client.client.setex(
+        _cache_key(canonical_question),
+        config.CACHE_TTL_SECONDS,
+        json.dumps({"answer": answer, "sources": sources}),
     )

@@ -90,9 +90,8 @@ def ingest_folder(folder: str) -> None:
     print(f"Embedding {len(rows)} chunks with '{config.EMBEDDING_MODEL_NAME}'...")
     embeddings = embed_texts([r[2] for r in rows])
 
-    print("Rebuilding kb_chunks and clearing the semantic cache...")
+    print("Rebuilding kb_chunks...")
     db.execute("TRUNCATE kb_chunks")
-    db.execute("TRUNCATE qa_cache")
     for (source, chunk_index, content), embedding in zip(rows, embeddings):
         db.execute(
             "INSERT INTO kb_chunks (source, chunk_index, content, embedding) VALUES (%s, %s, %s, %s)",
