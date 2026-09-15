@@ -47,6 +47,12 @@ def check_auth(credentials: Optional[HTTPBasicCredentials] = Depends(security)) 
         )
     _state.locked_until = None
 
+    # Reject all logins if credentials aren't configured. This prevents a
+    # credential bypass in misconfigured deployments (empty username/password
+    # would otherwise pass secrets.compare_digest("", "") and authenticate).
+    if not config.WEBAPP_USERNAME or not config.WEBAPP_PASSWORD:
+        raise HTTPException(status_code=401, detail="Webapp is not configured (missing credentials)")
+
     if credentials is None:
         # No credentials submitted yet -- prompt the browser. Doesn't count
         # as a failed attempt: this is the browser's first, credential-less
