@@ -73,6 +73,7 @@ def check_auth(credentials: Optional[HTTPBasicCredentials] = Depends(security)) 
     if _state.failed_attempts >= LOCKOUT_THRESHOLD:
         _state.locked_until = time.time() + LOCKOUT_SECONDS
         _state.failed_attempts = 0
+        print(f"[auth] Lockout triggered after {LOCKOUT_THRESHOLD} failed attempts. Locked until {_state.locked_until}.")
         raise HTTPException(
             status_code=429,
             detail=f"Too many failed login attempts. Try again in {LOCKOUT_SECONDS} seconds.",
