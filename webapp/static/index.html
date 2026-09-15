@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>MamaRoo Chat Service — Test Webapp</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 24px 16px 80px;
+    background: #f7f5f2;
+    color: #222;
+  }
+  h1 { font-size: 1.25rem; margin-bottom: 4px; }
+  p.sub { color: #666; margin-top: 0; font-size: 0.9rem; }
+
+  #log {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+  .msg { max-width: 85%; padding: 10px 14px; border-radius: 14px; white-space: pre-wrap; line-height: 1.4; }
+  .msg.user { align-self: flex-end; background: #dce7ff; border-bottom-right-radius: 4px; }
+  .msg.assistant { align-self: flex-start; background: #fff; border: 1px solid #e2e2e2; border-bottom-left-radius: 4px; }
+  .msg.error { align-self: flex-start; background: #ffe5e5; border: 1px solid #ffb3b3; color: #8a1f1f; }
+  .meta { font-size: 0.72rem; color: #888; margin-top: 6px; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 6px; font-size: 0.68rem; margin-right: 6px; }
+  .badge.cached { background: #d7f5dd; color: #1b6a2e; }
+  .badge.miss { background: #eee; color: #666; }
+
+  #composer { display: flex; gap: 8px; position: sticky; bottom: 12px; }
+  #composer input[type=text] {
+    flex: 1;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid #ccc;
+    font-size: 0.95rem;
+  }
+  #composer button, #reset {
+    padding: 10px 16px;
+    border: none;
+    border-radius: 10px;
+    background: #2b2b2b;
+    color: #fff;
+    font-size: 0.9rem;
+    cursor: pointer;
+  }
+  #reset { background: #888; margin-left: 8px; }
+  #composer button:disabled { opacity: 0.5; cursor: default; }
+
+  #status { font-size: 0.78rem; color: #888; min-height: 1.2em; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <h1>MamaRoo Chat Service — Test Webapp</h1>
+  <p class="sub">Ask a question from the knowledge base below.</p>
+
+  <div id="log"></div>
+  <div id="status"></div>
+
+  <div id="composer">
+    <input id="input" type="text" placeholder="Ask something from the knowledge base..." autofocus>
+    <button id="send">Send</button>
+    <button id="reset" title="Start a new conversation">New chat</button>
+  </div>
+
+<script>
+const log = document.getElementById('log');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+const resetBtn = document.getElementById('reset');
+const statusEl = document.getElementById('status');
+
+const endUserId = localStorage.getItem('mamaroo_end_user_id') || crypto.randomUUID();
+localStorage.setItem('mamaroo_end_user_id', endUserId);
+const sessionKey = 'mamaroo_webapp_session_id';
+
+function addMessage(role, text, meta) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.textContent = text;
+  if (meta) {
+    const metaDiv = document.createElement('div');
+    metaDiv.className = 'meta';
+    metaDiv.appendChild(meta);
+    div.appendChild(metaDiv);
+  }
+  log.appendChild(div);
+  window.scrollTo(0, document.body.scrollHeight);
+  return div;
+}
+
+function metaLine(cached, sources) {
+  const wrap = document.createElement('span');
+  const badge = document.createElement('span');
+  badge.className = 'badge ' + (cached ? 'cached' : 'miss');
+  badge.textContent = cached ? 'cache hit' : 'cache miss';
+  wrap.appendChild(badge);
+  if (sources && sources.length) {
+    wrap.appendChild(document.createTextNode('sources: ' + sources.join(', ')));
+  } else {
+    wrap.appendChild(document.createTextNode('no sources retrieved'));
+  }
+  return wrap;
+}
+
+async function sendMessage() {
+  const text = input.value.trim();
+  if (!text) return;
+  const sessionId = localStorage.getItem(sessionKey);
+
+  addMessage('user', text);
+  input.value = '';
+  sendBtn.disabled = true;
+  statusEl.textContent = 'Sending...';
+
+  try {
+    const res = await fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: text,
+        end_user_id: endUserId,
+        session_id: sessionId ? Number(sessionId) : null,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      addMessage('error', 'HTTP ' + res.status + ': ' + (data.detail || JSON.stringify(data)));
+    } else {
+      localStorage.setItem(sessionKey, String(data.session_id));
+      addMessage('assistant', data.answer, metaLine(data.cached, data.sources));
+    }
+  } catch (err) {
+    addMessage('error', 'Request failed: ' + err.message);
+  } finally {
+    statusEl.textContent = '';
+    sendBtn.disabled = false;
+    input.focus();
+  }
+}
+
+sendBtn.addEventListener('click', sendMessage);
+input.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendMessage(); });
+resetBtn.addEventListener('click', () => {
+  localStorage.removeItem(sessionKey);
+  log.innerHTML = '';
+  statusEl.textContent = 'Started a new conversation.';
+});
+</script>
+</body>
+</html>
